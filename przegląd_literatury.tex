@@ -1,0 +1,315 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[polish]{babel}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+
+\geometry{margin=2.5cm}
+
+\definecolor{accent}{RGB}{0,80,160}
+\titleformat{\section}{\large\bfseries\color{accent}}{\thesection.\ }{0.4em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.\ }{0.4em}{}
+
+\hypersetup{colorlinks=true, linkcolor=accent, urlcolor=accent, citecolor=accent}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{Obliczenia Superkomputerowe}
+\rhead{Przegląd literatury}
+\cfoot{\thepage}
+
+\title{\textbf{Przegląd literatury i~istniejących rozwiązań}\\[0.4em]
+\large Klasyfikacja aktywności człowieka na~sygnałach IMU\\
+z~wykorzystaniem własnej biblioteki sieci neuronowych przyspieszanej na~GPU}
+\author{Stanisław Krupa 254977 \and Julia Budziszewska 267769}
+\date{Politechnika Wrocławska \\ przedmiot: \textit{Obliczenia Superkomputerowe}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Niniejsza notatka stanowi przegląd literatury i~istniejących rozwiązań. Celem jest ustalenie tematu i~zakresu projektu, zestawienie metod stosowanych w~rozpoznawaniu aktywności człowieka (HAR) oraz w~obliczeniach na~akceleratorach GPU, a~także uzasadnienie wyboru architektury i~narzędzi obliczeniowych. Na podstawie źródeł przyjmujemy, że rdzeniem projektu będzie własna, wektoryzowana biblioteka sieci neuronowych (NumPy/CuPy) z~jednowymiarową siecią splotową, trenowaną na trzech reprezentacjach wejścia: surowych osiach (\textit{raw}), modułach wektorów (\textit{magnitude}) oraz ich połączeniu (\textit{hybrid}).
+\end{abstract}
+
+\section{Temat i~zakres projektu}
+
+\paragraph{Temat.}
+Implementacja od podstaw biblioteki głębokiego uczenia o~wspólnym interfejsie CPU/GPU oraz jej zastosowanie do klasyfikacji 18 aktywności człowieka na zbiorze sygnałów inercjalnych KU-HAR.
+
+\paragraph{Uzasadnienie tematu w~kontekście przedmiotu.}
+Głębokie uczenie na szeregach czasowych IMU jest zadaniem o~dużej intensywności obliczeniowej: tensory wejścia mają rząd $N \times C \times T$ (tysiące próbek, kilka kanałów, do $1500$ kroków czasowych), a~trening wymaga wielokrotnego splotu, normalizacji wsadowej i~propagacji wstecz. Jest to więc naturalny poligon dla technik obliczeń superkomputerowych: wektoryzacji, wykorzystania SIMT na GPU, porównania przepustowości CPU i~akceleratora oraz oceny narzutu własnej implementacji względem dojrzałych bibliotek (cuBLAS/cuDNN przez PyTorch).
+
+\paragraph{Zakres planowanych prac.}
+\begin{enumerate}[leftmargin=1.4em, itemsep=0.25em]
+  \item \textbf{Warstwa obliczeniowa:} backend tablicowy z~przełączaniem NumPy~$\leftrightarrow$~CuPy, bez przepisywania kodu warstw.
+  \item \textbf{Biblioteka NN:} warstwy \texttt{Dense}, \texttt{Conv1D}, \texttt{BatchNormalization}, aktywacje, dropout, pooling z~maską długości, optymalizatory SGD/Adam, straty MSE i~entropia krzyżowa, pętla \texttt{fit}/\texttt{predict} oraz serializacja modelu.
+  \item \textbf{Zadanie aplikacyjne:} zbiór KU-HAR (akcelerometr + żyroskop smartfona, 18 klas, sekwencje o~zmiennej długości).
+  \item \textbf{Trzy warianty cech:} \textit{raw} (6 kanałów), \textit{magnitude} (2 kanały -- normy $L_2$), \textit{hybrid} (8 kanałów).
+  \item \textbf{Weryfikacja:} ta sama architektura w~PyTorch; punkty odniesienia GRU oraz PatchTST; pomiar czasu CPU vs.\ GPU.
+\end{enumerate}
+Poza zakresem pozostawiamy: uczenie rozproszone na wielu węzłach, mieszaną precyzję (\texttt{float16}) oraz strojenie architektury metodą przeszukiwania siatki -- ze względu na ograniczony czas przedmiotu.
+
+\section{Istniejące rozwiązania i~źródła}
+
+Poniżej zestawiono pozycje pogrupowane tematycznie. Przy każdym źródle podano \textbf{wniosek} istotny dla projektu.
+
+\subsection{Zbiory danych i~klasyczne HAR}
+
+\begin{description}[style=nextline, leftmargin=0.6em, font=\normalfont]
+  \item[\cite{sikder2021kuhar} --- Sikder, Nahid, \emph{KU-HAR}, Pattern Recognit.\ Lett., 2021]
+  Autorzy udostępniają heterogeniczny zbiór 18 aktywności z~90 uczestników, rejestrowany wbudowanymi czujnikami smartfona. Jako bazę podają m.in.\ las losowy z~dokładnością rzędu $90\%$ na krótkich podpróbkach. \textbf{Wniosek:} zbiór jest trudniejszy niż klasyczny UCI-HAR (6 klas, ustalone okno), zawiera zarówno stany statyczne (siad, leżenie), jak i~dynamiczne (bieg, pompki), oraz zmienną długość nagrania -- wymaga maskowania paddingu. \textbf{Wybór:} KU-HAR jako zadanie docelowe, nie UCI-HAR, bo lepiej pokazuje skalę obliczeń (długie sekwencje, 18 klas).
+
+  \item[\cite{anguita2013har} --- Anguita i~in., UCI HAR, ESANN 2013]
+  Kanoniczny benchmark: cechy ręcznie wyliczone z~okna + SVM. \textbf{Wniosek:} tradycyjne HAR opiera się na inżynierskich statystykach (średnia, energia, FFT). Podejście to jest tanie obliczeniowo, ale słabo przenosi się na nowe aktywności. \textbf{Wybór:} nie budujemy klasyfikatora na cechach ręcznych jako głównego modelu; cechy głębokie mają być uczone ze sygnału.
+
+  \item[\cite{wang2019survey} --- Wang i~in., \emph{Deep learning for sensor-based activity recognition}, 2019]
+  Przegląd pokazuje dominację CNN 1D (kanały osi = kanały ``obrazu'') oraz RNN/LSTM dla zależności długozasięgowych. \textbf{Wniosek:} Conv1D na osiach czasowych to standard \emph{data-driven} i~jest dobrze wektoryzowalny. \textbf{Wybór:} CNN 1D jako model główny.
+\end{description}
+
+\subsection{Sieci splotowe, rekurencyjne i~transformery}
+
+\begin{description}[style=nextline, leftmargin=0.6em, font=\normalfont]
+  \item[\cite{yang2015cnn} --- Yang i~in., IJCAI 2015]
+  CNN na wielokanałowych szeregach IMU: splot i~pooling wzdłuż czasu, wspólne wagi między czujnikami. Autorzy podkreślają, że CNN jest wystarczająco szybka do HAR online. \textbf{Wniosek:} lokalne wzorce (kroki, uderzenia) są dobrze opisywane przez filtry 1D o~rosnącym polu odbiorczym. \textbf{Wybór:} trzy warstwy Conv1D z~malejącym jądrem ($31\to 15\to 7$) i~rosnącą liczbą filtrów ($32\to 64\to 128$), stride~$2$ w~głębszych warstwach jako tani substytut poolingu.
+
+  \item[\cite{ronao2016cnn} --- Ronao, Cho, 2016]
+  CNN na surowym sygnale smartfona bez ręcznych cech; głębokość i~regularyzacja silnie wpływają na uogólnienie. \textbf{Wniosek:} surowe osie wystarczą, jeśli sieć jest regularizowana. \textbf{Wybór:} BatchNorm, Dropout $0{,}2$ po blokach splotu i~$0{,}5$ przed klasyfikatorem.
+
+  \item[\cite{hammerla2016deep} --- Hammerla i~in., IJCAI 2016]
+  Porównanie CNN, LSTM i~modeli hybrydowych na noszonych czujnikach. LSTM bywa lepszy przy długim kontekście, ale trening jest sekwencyjny. \textbf{Wniosek:} RNN gorzej wykorzystuje równoległość GPU niż splot. \textbf{Wybór:} GRU/LSTM nie jako model główny, lecz jako \emph{baseline} w~PyTorch do oceny kompromisu dokładność--czas.
+
+  \item[\cite{chung2014gru} --- Chung i~in., 2014]
+  GRU upraszcza LSTM przy zbliżonej jakości. \textbf{Wniosek:} jeśli testować rekurencję, GRU jest tańszy. \textbf{Wybór:} dwuwarstwowe GRU jako punkt odniesienia.
+
+  \item[\cite{nie2023patchtst} --- Nie i~in., ICLR 2023, PatchTST]
+  Transformer na ``łatki'' szeregu czasowego, kanały niezależnie. Dobrze modeluje długi horyzont, ale jest pamięciożerny. \textbf{Wniosek:} dla $T=1500$ pełna uwaga jest kosztowna; PatchTST jest realistycznym SOTA do porównania, nie do własnej implementacji od zera. \textbf{Wybór:} PatchTST z~HuggingFace wyłącznie jako referencja, nie jako rdzeń biblioteki.
+\end{description}
+
+\subsection{Reprezentacje wejścia: raw, magnitude, hybrid}
+
+\begin{description}[style=nextline, leftmargin=0.6em, font=\normalfont]
+  \item[\cite{figo2010preprocessing} --- Figo i~in., 2010]
+  Przegląd preprocessingu IMU: osie surowe vs.\ cechy niezmiennicze (m.in.\ norma wektora przyspieszenia). \textbf{Wniosek:} magnitude $m_t=\lVert (x_t,y_t,z_t)\rVert_2$ jest tania i~odporna na obrót obudowy, ale gubi kierunek. \textbf{Wybór:} osobny wariant \textit{mag} (norma acc + norma gyro).
+
+  \item[\cite{yurtman2017orientation} --- Yurtman, Barshan, Sensors 2017]
+  Pokazują, że zmiana orientacji czujnika silnie psuje klasyfikatory na surowych osiach; transformaty niezmiennicze odzyskują część jakości. \textbf{Wniosek:} sam \textit{raw} może być kruchy, sam \textit{mag} --- zbyt ubogi dla klas różniących się orientacją ciała (stanie vs.\ leżenie). \textbf{Wybór:} wariant \textit{hybrid}: 6 osi + 2 moduły, aby sieć sama ważyła kierunek i~energię ruchu.
+
+  \item[\cite{shoaiB2014fusion} --- Shoaib i~in., 2014]
+  Fuzja akcelerometru i~żyroskopu poprawia HAR względem jednego czujnika. \textbf{Wniosek:} nie redukujemy wejścia do samego acc. \textbf{Wybór:} zawsze oba czujniki, we wszystkich trzech trybach.
+\end{description}
+
+\subsection{Elementy uczenia głębokiego (do samodzielnej implementacji)}
+
+\begin{description}[style=nextline, leftmargin=0.6em, font=\normalfont]
+  \item[\cite{ioffe2015bn} --- Ioffe, Szegedy, Batch Normalization, 2015]
+  Stabilizuje rozkład aktywacji, pozwala na wyższe $\eta$. \textbf{Wniosek:} BN jest standardem w~CNN i~musi mieć tryb train/eval (statystyki kroczące). \textbf{Wybór:} BN po każdej konwolucji i~po pierwszej warstwie gęstej.
+
+  \item[\cite{kingma2015adam} --- Kingma, Ba, Adam, 2015]
+  Adaptacyjne momenty; domyślne $\beta_1=0{,}9$, $\beta_2=0{,}999$. \textbf{Wniosek:} Adam jest mniej wrażliwy na skalę gradientu niż SGD -- istotne przy własnej, początkowo niestabilnej implementacji. \textbf{Wybór:} Adam jako optymalizator domyślny, SGD tylko do testów poprawności.
+
+  \item[\cite{he2015delving} --- He i~in., inicjalizacja, 2015]
+  Skalowanie $\sqrt{2/n_{\mathrm{in}}}$ dla ReLU/wariantów. \textbf{Wniosek:} zła inicjalizacja psuje Conv1D przy dużych jądrach. \textbf{Wybór:} He dla Dense i~Conv1D.
+
+  \item[\cite{srivastava2014dropout} --- Srivastava i~in., 2014; inverted dropout]
+  \textbf{Wybór:} dropout z~odwrotnym skalowaniem w~treningu, aby inferencja nie wymagała mnożenia wag.
+
+  \item[\cite{clevert2016elu,maas2013lrelu} --- ELU / Leaky ReLU]
+  Łagodzą problem martwych neuronów ReLU. \textbf{Wybór:} LeakyReLU we wczesnych blokach, ELU głębiej i~w~głowie klasyfikatora -- kompromis między tanim nieliniowym mapowaniem a~płynnym gradientem.
+
+  \item[\cite{lin2014gap} --- Lin i~in., Network-in-Network / global average pooling]
+  GAP zastępuje spłaszczenie, zmniejsza overfitting i~uniezależnia klasyfikator od $T$. \textbf{Wniosek:} przy zmiennej długości KU-HAR flatten byłby błędny (padding). \textbf{Wybór:} \emph{concat pool} (średnia + max) z~dzieleniem średniej przez prawdziwą długość sekwencji, nie przez $1500$.
+\end{description}
+
+\subsection{Obliczenia na GPU i~istniejące biblioteki}
+
+\begin{description}[style=nextline, leftmargin=0.6em, font=\normalfont]
+  \item[\cite{okuta2017cupy} --- Okuta i~in., CuPy, LearningSys @ NIPS 2017]
+  CuPy odwzorowuje API NumPy na CUDA (cuBLAS i~pokrewne). Wymiana \texttt{import numpy as np} na \texttt{cupy} przenosi obliczenia na GPU. \textbf{Wniosek:} własna biblioteka może być przenośna CPU/GPU bez kerneli CUDA pisanych ręcznie. \textbf{Wybór:} warstwa \texttt{backend.xp} jako alias tablic; to główny wkład HPC projektu.
+
+  \item[\cite{harris2007gpu} --- Harris, GPU GEMM / redukcja; model SIMT]
+  Efektywność GPU wymaga regularnego, wektoryzowanego dostępu do pamięci i~dużych paczek. \textbf{Wniosek:} pętle Python nad czasem $T$ zniszczą speedup. \textbf{Wybór:} Conv1D przez \texttt{as\_strided} + \texttt{tensordot} (im2col), batch $\geq 128$, \texttt{float32}.
+
+  \item[\cite{chetlur2014cudnn} --- Chetlur i~in., cuDNN]
+  Dojrzałe frameworki korzystają ze stopionych kerneli splotu. \textbf{Wniosek:} własna Conv1D będzie wolniejsza od PyTorch -- to oczekiwane i~warto zmierzyć, nie ukrywać. \textbf{Wybór:} identyczna architektura w~PyTorch jako górne ograniczenie wydajności.
+
+  \item[\cite{paszke2019pytorch} --- Paszke i~in., PyTorch]
+  Dynamiczny graf, autograd, przezroczyste GPU. \textbf{Wniosek:} PyTorch jest właściwym odniesieniem poprawności gradientów i~czasu, ale przesłania mechanikę wstecznej propagacji -- stąd własna implementacja na potrzeby dydaktyczne przedmiotu.
+
+  \item[\cite{van2011numpy} --- van der Walt i~in., NumPy]
+  \textbf{Wybór:} NumPy jako backend referencyjny (łatwy debug, zgodność z~testami jednostkowymi na CPU).
+\end{description}
+
+\section{Uzasadnienie wyboru metod}
+
+Na podstawie powyższego przeglądu przyjmujemy następujące decyzje \textbf{projektowe} (do weryfikacji empirycznej w~dalszej części przedmiotu).
+
+\begin{enumerate}[leftmargin=1.4em, itemsep=0.4em]
+  \item \textbf{Własna biblioteka, nie sam PyTorch.}
+  Przedmiot wymaga świadomego sterowania obliczeniami (układ pamięci, wybór urządzenia, koszt warstwy), a~nie wyłącznie wywołania \texttt{nn.Module}. PyTorch pozostaje narzędziem kontrolnym.
+
+  \item \textbf{Conv1D zamiast GRU jako model główny.}
+  Splot jest równoległy w~czasie i~w~batchu, więc lepiej saturuje GPU~\cite{yang2015cnn,harris2007gpu}. GRU testujemy później, spodziewając się gorszego wykorzystania akceleratora~\cite{hammerla2016deep}.
+
+  \item \textbf{Trzy wejścia: raw / magnitude / hybrid.}
+  Literatura pokazuje konflikt: osie dają kierunek, moduł daje niezmienniczość na obrót~\cite{figo2010preprocessing,yurtman2017orientation}. Porównanie trzech trybów \emph{przy identycznej sieci} pozwoli oddzielić wpływ cech od wpływu architektury.
+
+  \item \textbf{Maskowany concat-pooling zamiast Flatten.}
+  KU-HAR ma pole długości i~zero-padding~\cite{sikder2021kuhar}; średnia po całym $T$ fałszowałaby sygnał. Max wnosi piki (skok, uderzenie), średnia -- tło aktywności.
+
+  \item \textbf{Adam + BN + Dropout + early stopping.}
+  Zestaw minimalny, który w~literaturze CNN-HAR stabilizuje trening bez ręcznego strojenia SGD~\cite{ioffe2015bn,kingma2015adam,ronao2016cnn}.
+
+  \item \textbf{CuPy jako warstwa superkomputerowa.}
+  Zamiast pisać CUDA C++, odwzorowujemy NumPy na GPU~\cite{okuta2017cupy} i~planujemy zmierzyć speedup względem CPU na tej samej ścieżce kodu. To jest mierzalny cel HPC: nie ``najlepszy model na świecie'', lecz \emph{przenośna, wektoryzowana} implementacja, której wąskie gardło da się porównać z~cuDNN.
+\end{enumerate}
+
+Planowana architektura docelowa (szkic):
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Blok & Jednostki & Kernel / stride / pad & Dalej \\
+\midrule
+Conv1D & 32  & $31/1/15$ & BN, LeakyReLU \\
+Conv1D & 64  & $15/2/7$  & BN, LeakyReLU, Dropout $0{,}2$ \\
+Conv1D & 128 & $7/2/3$   & BN, ELU \\
+GlobalConcatPool1D & $256$ cech & maska długości & --- \\
+Dense & 128 & --- & BN, ELU, Dropout $0{,}5$ \\
+Dense + Softmax & 18 klas & --- & entropia krzyżowa \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Podsumowanie przeglądu}
+
+Literatura HAR wskazuje CNN 1D na surowym IMU jako dojrzały, obliczeniowo korzystny punkt startu, a~literatura GPU -- CuPy jako najkrótszą drogę do akceleracji kodu tablicowego bez rezygnacji z~NumPy. Luka, którą projekt zamierza wypełnić, nie polega na nowym algorytmie SOTA, lecz na \textbf{spójnym połączeniu}: własna, przezroczysta implementacja wstecznej propagacji, trzy świadome reprezentacje IMU oraz pomiar, ile wydajności traci się względem PyTorch/cuDNN, zyskując pełną kontrolę nad jądrem obliczeniowym. Na tej podstawie przechodzimy do implementacji.
+
+\begin{thebibliography}{99}
+
+\bibitem{sikder2021kuhar}
+N.~Sikder, A.-A.~Nahid,
+\textit{KU-HAR: An open dataset for heterogeneous human activity recognition},
+Pattern Recognition Letters, 146, 46--54, 2021.
+
+\bibitem{anguita2013har}
+D.~Anguita, A.~Ghio, L.~Oneto, X.~Parra, J.~L.~Reyes-Ortiz,
+\textit{A public domain dataset for human activity recognition using smartphones},
+ESANN, 2013.
+
+\bibitem{wang2019survey}
+J.~Wang, Y.~Chen, S.~Hao, X.~Peng, L.~Hu,
+\textit{Deep learning for sensor-based activity recognition: A survey},
+Pattern Recognition Letters, 119, 3--11, 2019.
+
+\bibitem{yang2015cnn}
+J.~B.~Yang, M.~N.~Nguyen, P.~P.~San, X.~L.~Li, S.~Krishnaswamy,
+\textit{Deep convolutional neural networks on multichannel time series for human activity recognition},
+IJCAI, 2015.
+
+\bibitem{ronao2016cnn}
+C.~A.~Ronao, S.-B.~Cho,
+\textit{Human activity recognition with smartphone sensors using deep learning architectures},
+Expert Systems with Applications, 59, 235--246, 2016.
+
+\bibitem{hammerla2016deep}
+N.~Y.~Hammerla, S.~Halloran, T.~Plötz,
+\textit{Deep, convolutional, and recurrent models for human activity recognition using wearables},
+IJCAI, 2016.
+
+\bibitem{chung2014gru}
+J.~Chung, C.~Gulcehre, K.~Cho, Y.~Bengio,
+\textit{Empirical evaluation of gated recurrent neural networks on sequence modeling},
+arXiv:1412.3555, 2014.
+
+\bibitem{nie2023patchtst}
+Y.~Nie, N.~H.~Nguyen, P.~Sinthong, J.~Kalagnanam,
+\textit{A time series is worth 64 words: Long-term forecasting with transformers},
+ICLR, 2023.
+
+\bibitem{figo2010preprocessing}
+D.~Figo, P.~C.~Diniz, D.~R.~Ferreira, J.~M.~P.~Cardoso,
+\textit{Preprocessing techniques for context recognition from accelerometer data},
+Personal and Ubiquitous Computing, 14(7), 645--662, 2010.
+
+\bibitem{yurtman2017orientation}
+A.~Yurtman, B.~Barshan,
+\textit{Activity recognition invariant to sensor orientation with wearable motion sensors},
+Sensors, 17(8), 1838, 2017.
+
+\bibitem{shoaiB2014fusion}
+M.~Shoaib, S.~Bosch, O.~D.~Incel, H.~Scholten, P.~J.~M.~Havinga,
+\textit{Fusion of smartphone motion sensors for physical activity recognition},
+Sensors, 14(6), 10146--10176, 2014.
+
+\bibitem{ioffe2015bn}
+S.~Ioffe, C.~Szegedy,
+\textit{Batch normalization: Accelerating deep network training by reducing internal covariate shift},
+ICML, 2015.
+
+\bibitem{kingma2015adam}
+D.~P.~Kingma, J.~Ba,
+\textit{Adam: A method for stochastic optimization},
+ICLR, 2015.
+
+\bibitem{he2015delving}
+K.~He, X.~Zhang, S.~Ren, J.~Sun,
+\textit{Delving deep into rectifiers: Surpassing human-level performance on ImageNet classification},
+ICCV, 2015.
+
+\bibitem{srivastava2014dropout}
+N.~Srivastava, G.~Hinton, A.~Krizhevsky, I.~Sutskever, R.~Salakhutdinov,
+\textit{Dropout: A simple way to prevent neural networks from overfitting},
+JMLR, 15, 1929--1958, 2014.
+
+\bibitem{clevert2016elu}
+D.-A.~Clevert, T.~Unterthiner, S.~Hochreiter,
+\textit{Fast and accurate deep network learning by exponential linear units (ELUs)},
+ICLR, 2016.
+
+\bibitem{maas2013lrelu}
+A.~L.~Maas, A.~Y.~Hannun, A.~Y.~Ng,
+\textit{Rectifier nonlinearities improve neural network acoustic models},
+ICML Workshop, 2013.
+
+\bibitem{lin2014gap}
+M.~Lin, Q.~Chen, S.~Yan,
+\textit{Network in network},
+ICLR, 2014.
+
+\bibitem{okuta2017cupy}
+R.~Okuta, Y.~Unno, D.~Nishino, S.~Hido, C.~Loomis,
+\textit{CuPy: A NumPy-compatible library for NVIDIA GPU calculations},
+LearningSys Workshop, NIPS, 2017.
+
+\bibitem{harris2007gpu}
+M.~Harris,
+\textit{Optimizing parallel reduction in CUDA},
+NVIDIA Developer Technology, 2007.
+
+\bibitem{chetlur2014cudnn}
+S.~Chetlur i~in.,
+\textit{cuDNN: Efficient primitives for deep learning},
+arXiv:1410.0759, 2014.
+
+\bibitem{paszke2019pytorch}
+A.~Paszke i~in.,
+\textit{PyTorch: An imperative style, high-performance deep learning library},
+NeurIPS, 2019.
+
+\bibitem{van2011numpy}
+S.~van der Walt, S.~C.~Colbert, G.~Varoquaux,
+\textit{The NumPy array: A structure for efficient numerical computation},
+Computing in Science \& Engineering, 13(2), 22--30, 2011.
+
+\end{thebibliography}
+
+\end{document}

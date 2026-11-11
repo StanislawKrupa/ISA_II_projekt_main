@@ -1,0 +1,424 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[polish]{babel}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{microtype}
+\usepackage{hyperref}
+
+\geometry{margin=2.5cm}
+
+\definecolor{accent}{RGB}{0,80,160}
+\titleformat{\section}{\large\bfseries\color{accent}}{}{0em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+
+\hypersetup{colorlinks=true, linkcolor=accent, urlcolor=accent}
+
+\title{\textbf{Notatka techniczna: Własna biblioteka sieci neuronowych\\
+z~zastosowaniem do rozpoznawania aktywności człowieka (HAR)}}
+\author{Przygotowane dla autora kodu -- materiał na spotkanie}
+\date{21 czerwca 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% -----------------------------------------------------------------------
+\section{Cel i zakres projektu}
+
+Projekt polega na \textbf{samodzielnej implementacji biblioteki sieci neuronowych od podstaw} (bez użycia PyTorch ani TensorFlow jako silnika obliczeń) w~Pythonie, opartej wyłącznie o~NumPy (ewentualnie CuPy na GPU). Zbudowana biblioteka została następnie użyta do rozwiązania \textbf{zadania klasyfikacji aktywności człowieka} (Human Activity Recognition -- HAR) na zbiorze danych z~czujników IMU.
+
+Projekt obejmuje:
+\begin{itemize}
+  \item budowę pełnego frameworku (warstwy, optymalizatory, funkcje straty, pętla uczenia),
+  \item trening i~ewaluację trzech wariantów przetwarzania danych wejściowych,
+  \item porównanie wynikowej sieci z~modelami referencyjnymi: PyTorch CNN, PatchTST (Transformer) i~GRU,
+  \item analizę efektywności obliczeniowej (CPU vs.\ GPU).
+\end{itemize}
+
+% -----------------------------------------------------------------------
+\section{Zbiór danych -- KU-HAR v1.0}
+
+\subsection{Charakterystyka}
+\begin{itemize}
+  \item \textbf{Plik:} \texttt{data/KU-HAR\_v1.0\_raw\_samples.csv}
+  \item \textbf{Liczba próbek:} 9\,185
+  \item \textbf{Liczba kanałów:} 6 (trzy osie akcelerometru + trzy osie żyroskopu)
+  \item \textbf{Długość sekwencji:} do 1\,500 kroków czasowych (sekwencje \emph{zmienna-długość})
+  \item \textbf{Liczba klas:} 18 aktywności
+\end{itemize}
+
+\subsection{Klasy aktywności}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ID & Aktywność & ID \quad Aktywność \\
+\midrule
+0  & Stand        & 9  \quad Push-up \\
+1  & Sit          & 10 \quad Sit-up \\
+2  & Talk-sit     & 11 \quad Walk \\
+3  & Talk-stand   & 12 \quad Walk-backward \\
+4  & Stand-sit    & 13 \quad Walk-circle \\
+5  & Lay          & 14 \quad Run \\
+6  & Lay-stand    & 15 \quad Stair-up \\
+7  & Pick         & 16 \quad Stair-down \\
+8  & Jump         & 17 \quad Table-tennis \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Klasy są \textbf{niezbalansowane} -- najliczniejsza: Stand-sit (791 próbek), najmniej liczna: Walk-circle (172 próbki).
+
+\subsection{Tryby przetwarzania wejścia}
+
+Dane przygotowywane są w~trzech trybach (funkcja \texttt{prepare\_har\_dataset}):
+
+\begin{description}[leftmargin=3cm, style=nextline]
+  \item[\texttt{raw}]    Surowe sygnały 6-kanałowe (akcelerometr + żyroskop) przeskalowane przez \texttt{StandardScaler}. Kształt tensora: \texttt{[N, 6, T]}.
+  \item[\texttt{mag}]    Moduł (magnitude) wyliczony z~kanałów -- redukuje liczbę kanałów, zachowuje siłę sygnału.
+  \item[\texttt{hybrid}] Połączenie surowych kanałów z~wyliczonymi modułami -- więcej informacji wejściowej.
+\end{description}
+
+Funkcja obsługuje:
+\begin{itemize}
+  \item maskowanie sekwencji o~różnej długości (tablica \texttt{lengths} -- rzeczywista liczba kroków czasowych),
+  \item uzupełnianie zerami (zero-padding) do stałej długości,
+  \item opcjonalne przetasowanie (shuffle) z~ziarniem losowości.
+\end{itemize}
+
+Podział zbioru: trening / walidacja / test (split stratified).
+
+% -----------------------------------------------------------------------
+\section{Architektura biblioteki}
+
+\subsection{Wzorzec projektowy}
+
+Biblioteka jest wzorowana na API Keras/PyTorch i~opiera się o~klasy abstrakcyjne (ABC):
+
+\begin{itemize}
+  \item \textbf{\texttt{Layer}} -- bazowa klasa warstwy. Każda warstwa implementuje trzy metody:
+    \begin{itemize}
+      \item \texttt{build(input\_shape)} -- inicjalizacja wag przy pierwszym wywołaniu,
+      \item \texttt{forward(x, training)} -- propagacja wprzód,
+      \item \texttt{backward(output\_gradient)} -- propagacja wstecz, wyznaczenie gradientów.
+    \end{itemize}
+  \item \textbf{\texttt{Network}} -- bazowa klasa modelu. Implementuje \texttt{fit()}, \texttt{predict()}, \texttt{save()}, \texttt{load()}.
+  \item \textbf{\texttt{Sequential}} -- konkretny model: lista warstw, wołana sekwencyjnie w~przód i~w~tył.
+  \item \textbf{\texttt{Optimizer}} -- bazowa klasa optymalizatora.
+  \item \textbf{\texttt{Loss}} -- bazowa klasa funkcji straty.
+\end{itemize}
+
+Warstwy budowane są \textbf{leniwie} (lazy build): wagi inicjalizowane są dopiero przy pierwszym wywołaniu, gdy znany jest kształt wejścia.
+
+\subsection{Warstwy zaimplementowane}
+
+\subsubsection*{Warstwy z~parametrami}
+
+\begin{description}[leftmargin=3cm]
+  \item[\texttt{Dense}] Warstwa w~pełni połączona. Wagi inicjalizowane metodą \textbf{He} ($\sigma = \sqrt{2/n_{in}}$). Operacja: $y = xW + b$.
+
+  \item[\texttt{Conv1D}] Splotowa warstwa 1D. Parametry: \texttt{filters}, \texttt{kernel\_size}, \texttt{stride}, \texttt{padding}. Inicjalizacja: He dla konwolucji ($\sqrt{2 / (C_{in} \cdot k)}$). \textbf{Optymalizacja wydajności}: propagacja wprzód używa \texttt{numpy.lib.stride\_tricks.as\_strided} zamiast jawnych pętli -- tworzy widok na dane bez kopiowania pamięci.
+
+  \item[\texttt{BatchNormalization}] Normalizacja wsadowa z~parametrami $\gamma$, $\beta$ i~wykładniczą średnią kroczącą (\texttt{momentum=0.9}) dla wnioskowania. Zachowanie różne podczas treningu i~inferencji.
+\end{description}
+
+\subsubsection*{Warstwy aktywacji (bez parametrów trenowalnych)}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Klasa & Wzór & Gradient \\
+\midrule
+\texttt{ReLU}      & $\max(0, x)$                                  & $\mathbf{1}[x > 0]$ \\
+\texttt{LeakyReLU} & $x$ jeśli $x>0$, else $\alpha x$              & $1$ lub $\alpha$ \\
+\texttt{ELU}       & $x$ jeśli $x>0$, else $\alpha(e^x - 1)$      & $1$ lub $\alpha e^x$ \\
+\texttt{Sigmoid}   & $1/(1+e^{-x})$                                & $\sigma(1-\sigma)$ \\
+\texttt{Tanh}      & $\tanh(x)$                                    & $1 - \tanh^2(x)$ \\
+\texttt{Softmax}   & $e^{x_i}/\sum e^{x_j}$ (stabilna: odejmuje max) & pełny Jacobian \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{Warstwy poolingu}
+
+\begin{description}[leftmargin=3cm]
+  \item[\texttt{MaskedGlobalAveragePool1D}] Global average pooling z~uwzględnieniem maski długości. Dzieli sumę przez rzeczywistą liczbę kroków (nie przez długość po paddingu).
+  \item[\texttt{GlobalConcatPool1D}] Łączy \emph{average pooling} i~\emph{max pooling} przez konkatenację -- podwaja liczbę cech. Obsługuje maskowanie.
+  \item[\texttt{Flatten}] Spłaszcza tensor do wektora.
+\end{description}
+
+\subsubsection*{Regularyzacja}
+
+\begin{description}[leftmargin=3cm]
+  \item[\texttt{Dropout}] Dropout z~\textbf{odwrotnym skalowaniem} (inverted dropout): podczas treningu losowo zeruje neurony z~prawdopodobieństwem \texttt{rate} i~skaluje aktywne przez $1/(1-\text{rate})$, dzięki czemu wagi podczas inferencji nie wymagają skalowania.
+\end{description}
+
+% -----------------------------------------------------------------------
+\section{Optymalizatory}
+
+\subsection{SGD (Stochastic Gradient Descent)}
+Klasyczna reguła aktualizacji:
+\[
+  \theta \leftarrow \theta - \eta \cdot \nabla_\theta \mathcal{L}
+\]
+
+\subsection{Adam}
+Adaptacyjny optymalizator momentowy:
+\[
+  m_t = \beta_1 m_{t-1} + (1-\beta_1)\,g_t, \quad
+  v_t = \beta_2 v_{t-1} + (1-\beta_2)\,g_t^2
+\]
+\[
+  \hat{m}_t = \frac{m_t}{1-\beta_1^t}, \quad
+  \hat{v}_t = \frac{v_t}{1-\beta_2^t}, \quad
+  \theta \leftarrow \theta - \eta\,\frac{\hat{m}_t}{\sqrt{\hat{v}_t}+\varepsilon}
+\]
+
+Domyślne hiperparametry: $\eta=10^{-3}$, $\beta_1=0.9$, $\beta_2=0.999$, $\varepsilon=10^{-8}$.
+
+Stany momentów (\texttt{m}, \texttt{v}) przechowywane są w~słownikach indeksowanych identyfikatorem warstwy i~numeru parametru.
+
+% -----------------------------------------------------------------------
+\section{Funkcje straty}
+
+\subsection{Mean Squared Error (MSE)}
+\[
+  \mathcal{L} = \frac{1}{N}\sum_i (y_i - \hat{y}_i)^2, \quad
+  \frac{\partial \mathcal{L}}{\partial \hat{y}} = \frac{2(\hat{y} - y)}{N}
+\]
+
+\subsection{Cross-Entropy (kategoryczna)}
+\[
+  \mathcal{L} = -\frac{1}{N}\sum_i \sum_c y_{ic}\log(\hat{y}_{ic})
+\]
+Gradient: $-y/\hat{y}_{\text{clip}}/N$.
+Implementacja \textbf{obcina} prawdopodobieństwa do przedziału $[10^{-7},\,1-10^{-7}]$, aby uniknąć $\log(0)$.
+
+% -----------------------------------------------------------------------
+\section{Pętla uczenia -- metoda \texttt{fit()}}
+
+\subsection{Przepływ jednej epoki}
+
+\begin{enumerate}
+  \item (Opcjonalnie) \textbf{rozpad współczynnika uczenia} (LR decay): co \texttt{lr\_decay\_epochs} epok mnożony przez stały współczynnik.
+  \item Mini-batch: dane dzielone na paczki rozmiaru \texttt{batch\_size} i~przetwarzane sekwencyjnie.
+  \item \textbf{Krok treningu} (\texttt{train\_step}):
+    \begin{enumerate}[label=\alph*)]
+      \item propagacja wprzód (\texttt{\_predict}),
+      \item obliczenie straty i~jej gradientu,
+      \item propagacja wstecz przez wszystkie warstwy w~odwrotnej kolejności,
+      \item aktualizacja wag przez optymalizator.
+    \end{enumerate}
+  \item Obliczenie strat i~dokładności na zbiorze walidacyjnym (bez aktualizacji wag, \texttt{training=False}).
+  \item Zapis metryk do obiektu \texttt{TrainingHistory}.
+\end{enumerate}
+
+\subsection{Early stopping}
+
+Mechanizm wczesnego zatrzymania oparty na stracie walidacyjnej:
+\begin{itemize}
+  \item Parametry: \texttt{early\_stopping\_patience}, \texttt{early\_stopping\_min\_delta}.
+  \item Po każdej epoce: jeśli $\mathcal{L}_{\text{val}} < \mathcal{L}_{\text{best}} - \delta$, zapisuje model do pliku \texttt{temp\_early\_stopping\_best.nnp} i~resetuje licznik.
+  \item Gdy licznik osiągnie \texttt{patience} -- przywraca najlepsze wagi z~pliku i~przerywa uczenie.
+\end{itemize}
+
+\subsection{Serializacja modelu}
+
+\begin{itemize}
+  \item \texttt{save(filepath)} -- konwertuje wszystkie macierze wag do NumPy (CPU), serializuje przez \texttt{pickle} do pliku \texttt{.nnp}.
+  \item \texttt{load(filepath)} -- deserializuje i~przenosi wagi na bieżące urządzenie (CPU/GPU).
+\end{itemize}
+
+% -----------------------------------------------------------------------
+\section{Backend obliczeniowy -- NumPy / CuPy}
+
+Klasa \texttt{BackendManager} zarządza wyborem backendu:
+\begin{itemize}
+  \item Domyślnie: \textbf{NumPy} (CPU).
+  \item Jeśli żądane GPU (\texttt{use\_gpu=True}) i~zbiór danych przekracza \texttt{min\_gpu\_bytes} -- próbuje załadować \textbf{CuPy}.
+  \item Weryfikuje dostępność GPU przez \texttt{cuda.runtime.getDeviceCount()} i~testowe obliczenie.
+  \item Każda warstwa i~optymalizator używają \texttt{backend.xp} jako aliasu do aktualnego modułu tablicowego -- \textbf{kod warstw jest identyczny} niezależnie od backendu.
+\end{itemize}
+
+% -----------------------------------------------------------------------
+\section{Architektura modelu CNN dla HAR}
+
+Model budowany funkcją \texttt{prepare\_model()}:
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Warstwa & Filtry/Jednostki & Kernel/Stride/Padding & Po warstwie \\
+\midrule
+\texttt{Conv1D}         & 32   & $31 / 1 / 15$  & BatchNorm → ELU → Dropout(0.2) \\
+\texttt{Conv1D}         & 64   & $15 / 2 / 7$   & BatchNorm → ELU → Dropout(0.2) \\
+\texttt{Conv1D}         & 128  & $7  / 2 / 3$   & BatchNorm → ELU → Dropout(0.2) \\
+\texttt{GlobalConcatPool1D} & -- & --           & avg + max → 256 cech \\
+\texttt{Dense}          & 128  & --             & BatchNorm → ELU → Dropout(0.5) \\
+\texttt{Dense}          & 18   & --             & Softmax \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Kluczowe decyzje architektoniczne:}
+\begin{itemize}
+  \item Trzy warstwy Conv1D ze stopniowo rosnącymi filtrami (32→64→128) i~malejącym rozmiarem kernela (31→15→7) agregują cechy na różnych skalach czasowych.
+  \item Padding \textit{same} (dopełnienie równe połowie rozmiaru kernela) zachowuje długość sekwencji po pierwszej konwolucji; stride=2 w~warstwach 2 i~3 redukuje rozdzielczość czasową.
+  \item \texttt{GlobalConcatPool1D} (avg + max pooling) daje bogatszą reprezentację niż sam średni pooling.
+  \item Silny Dropout(0.5) przed klasyfikatorem zapobiega przeuczeniu.
+  \item \texttt{ELU} zamiast \texttt{ReLU} -- nie ma „martwych neuronów", gradient przepływa dla wartości ujemnych.
+  \item Maska długości sekwencji propagowana przez model i~uwzględniana w~poolingu.
+\end{itemize}
+
+Optymalizator: \textbf{Adam}, $\eta=10^{-3}$.
+Funkcja straty: \textbf{Cross-Entropy}.
+Batchsize: \textbf{128}, maks. epok: \textbf{150}.
+LR decay: co 30 epok mnożony przez stały współczynnik.
+
+% -----------------------------------------------------------------------
+\section{Wyniki eksperymentów}
+
+\subsection{Porównanie trybów danych (sekcje 1--4 notebooka)}
+
+Każdy model trenowany osobno na tym samym zbiorze, ta sama architektura.
+
+\begin{center}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Tryb & Acc. (test) & Czas treningu & Epoka stopu & Uwagi \\
+\midrule
+\texttt{raw}    & 93.6\%  & 382 s  & 139 & 6 kanałów \\
+\texttt{mag}    & 83.9\%  & 257 s  & 106 & zredukowane kanały \\
+\texttt{hybrid} & \textbf{94.4\%}  & 359 s  & 126 & najlepszy wynik \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Zbiorczy test (sekcja 4, shuffle=False, inny podział):
+\begin{center}
+\begin{tabular}{@{}lc@{}}
+\toprule
+Model & Dokładność \\
+\midrule
+Raw    & 87.97\% \\
+Magnitude & 87.53\% \\
+Hybrid & 96.30\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Wnioski:} tryb \texttt{hybrid} konsekwentnie osiąga najwyższą dokładność. Tryb \texttt{mag} znacznie gorszy -- informacja kierunkowa (osie) jest istotna.
+
+Najtrudniejsze klasy (najwyższy error rate): Stand, Sit, Talk-sit -- aktywności statyczne, łatwe do pomylenia. Aktywności dynamiczne (Push-up, Stair-up, Jump) -- prawie idealna precyzja i~czułość.
+
+\subsection{Porównanie z~PyTorch CNN (sekcja 5)}
+
+Identyczna architektura zaimplementowana w~PyTorch, trening na tych samych danych (\texttt{raw}, batch=128, max 150 epok, early stopping).
+
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Framework & Czas treningu & Epoka stopu \\
+\midrule
+PyTorch (referencja) & 155.76 s & 98 \\
+Własna biblioteka    & 272.97 s & 98 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Własna biblioteka jest ok.\ \textbf{1.75$\times$ wolniejsza} od PyTorch -- oczekiwane, biorąc pod uwagę brak niskopoziomowych optymalizacji (cuDNN, TorchScript, kernel fusion).
+
+\subsection{Porównanie z~PatchTST (sekcja 6)}
+
+\textbf{PatchTST} to Transformer do klasyfikacji szeregów czasowych z~biblioteki HuggingFace (\texttt{transformers}):
+\begin{itemize}
+  \item \texttt{patch\_length=16}, \texttt{patch\_stride=8},
+  \item trenowany z~AdamW, early stopping (\texttt{patience=20}),
+  \item batch=16 (mały ze względu na rozmiar modelu).
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Model & Dokładność (test) & Czas treningu \\
+\midrule
+Własna CNN (raw)  & 93.6\%  & 382 s \\
+PatchTST          & 96.1\%  & 778 s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+PatchTST osiąga wyższą dokładność (\textbf{+2.5 pp}), lecz kosztem \textbf{ponad 2$\times$ dłuższego czasu treningu} i~mniejszego batch size.
+
+\subsection{Porównanie z~GRU (sekcja 7)}
+
+Rekurencyjna sieć GRU zaimplementowana w~PyTorch: 2 warstwy, \texttt{hidden\_dim=128}, BatchNorm1D, warstwa FC, Dropout(0.2 między warstwami GRU).
+
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Model & Dokładność (test) & Czas treningu \\
+\midrule
+Własna CNN (raw) & 93.6\%   & 382 s \\
+GRU (PyTorch)    & 84.8\%   & 355 s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+GRU osiąga \textbf{niższą dokładność} niż własna CNN przy podobnym czasie treningu.
+
+\subsection{Porównanie GPU vs.\ CPU (sekcja 8)}
+
+Backend switching: ten sam kod modelu wykonany na CPU (NumPy) i~GPU (CuPy) -- automatyczny wybór przez \texttt{BackendManager}. Pomiar przyspieszenia (speedup) podany w~notebooku.
+
+% -----------------------------------------------------------------------
+\section{Metryki ewaluacji}
+
+Do oceny modeli stosowane są:
+\begin{itemize}
+  \item \textbf{Accuracy} (dokładność globalna),
+  \item \textbf{Macro F1-score} -- średnia F1 po klasach (bez ważenia licznością),
+  \item \textbf{Precision i~Recall} per klasa,
+  \item \textbf{Macierz konfuzji} (confusion matrix),
+  \item \textbf{Top-N wzajemnie mylonych par klas} (mutual confusion),
+  \item \textbf{Krzywe uczenia} (train/val loss i~accuracy vs.\ epoka).
+\end{itemize}
+
+Ewaluacja walidacyjna wykonywana jest w~każdej epoce w~trybie \texttt{training=False} (BatchNorm używa statystyk ruchomych, Dropout wyłączony).
+
+% -----------------------------------------------------------------------
+\section{Potencjalne pytania i~odpowiedzi}
+
+\subsection*{Dlaczego implementacja od podstaw, a~nie PyTorch?}
+Celem projektu było zrozumienie i~zademonstrowanie mechanizmów głębokiego uczenia: propagacji wstecz, inicjalizacji wag, zachowania BatchNorm, mechanizmu Dropout -- nie tylko użycie gotowego frameworku.
+
+\subsection*{Czym jest \texttt{as\_strided} w~Conv1D i~dlaczego?}
+\texttt{numpy.lib.stride\_tricks.as\_strided} tworzy \textit{widok} na tablicę danych z~przesuniętymi stridami, co pozwala wyekstrahować wszystkie okna splotu bez kopiowania danych. To znacząco przyspiesza propagację wprzód konwolucji w~porównaniu do naiwnych pętli.
+
+\subsection*{Dlaczego tryb \texttt{hybrid} daje lepsze wyniki niż \texttt{raw}?}
+Hybrid łączy surowe sygnały kierunkowe (informacja o~orientacji ruchu) z~wyliczonymi modułami (informacja o~sile ruchu), dostarczając modelowi bogatszy i~bardziej zróżnicowany zestaw cech.
+
+\subsection*{Co to jest maska (\texttt{lengths}) i~dlaczego jest potrzebna?}
+Próbki w~KU-HAR mają różną długość (czas nagrania). Po paddingu zerami tensor ma stały rozmiar, ale pooling globalny musi wiedzieć, ile kroków jest \textit{prawdziwych}, żeby nie uśredniać zer po paddingu -- stąd tablica \texttt{lengths} z~rzeczywistą długością każdej próbki.
+
+\subsection*{Dlaczego early stopping przywraca wagi, a~nie kończy po prostu trening?}
+Model zapisywany jest do pliku w~każdej epoce poprawiającej wynik walidacyjny. Gdy cierpliwość się wyczerpie, przywracane są wagi z~najlepszej epoki -- nie z~ostatniej, która może być już przegrzana.
+
+\subsection*{Czym różni się \texttt{GlobalConcatPool1D} od \texttt{MaskedGlobalAveragePool1D}?}
+\texttt{GlobalConcatPool1D} oblicza \textit{zarówno} średni jak i~maksymalny pooling i~konkatenuje wyniki -- podwaja wymiar wyjściowy, dając modelowi informację zarówno o~przeciętnej jak i~o~szczytowej aktywacji. \texttt{MaskedGlobalAveragePool1D} oblicza tylko średnią.
+
+\subsection*{Dlaczego PatchTST jest wolniejszy, skoro używa PyTorch z~GPU?}
+PatchTST trenowany był z~batch=16 (architektura Transformer wymaga więcej pamięci), co przy dużych sekwencjach daje mniej równoległy trening. Wagi Transformera to miliony parametrów więcej niż CNN.
+
+\subsection*{Jak zapisywany jest model i~w~jakim formacie?}
+Przez \texttt{pickle} do pliku z~rozszerzeniem \texttt{.nnp} (Neural Network Pickle). Przed zapisem wagi konwertowane są do NumPy (z GPU na CPU), żeby plik był przenośny niezależnie od środowiska.
+
+\end{document}
