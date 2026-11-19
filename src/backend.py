@@ -82,6 +82,12 @@ class BackendManager:
             return self._cp.asnumpy(x)
         return np.asarray(x)
 
+    def free_memory(self) -> None:
+        """Return unused blocks held by CuPy's memory pools to the driver (e.g. so PyTorch can use them)."""
+        if self._cp is not None:
+            self._cp.get_default_memory_pool().free_all_blocks()
+            self._cp.get_default_pinned_memory_pool().free_all_blocks()
+
     def device_info(self):
         if self.name == "cupy":
             cp_mod = self._load_cupy()

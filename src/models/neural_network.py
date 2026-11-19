@@ -9,6 +9,24 @@ from src.models.history import TrainingHistory
 from src.optimizer.base import Optimizer
 from src.types import Array
 
+# Activations cached by layers during the forward pass. They are only needed by the backward pass,
+# so after inference they just occupy (GPU) memory - for Conv1D the im2col `windows` can take GBs.
+FORWARD_CACHE_VARS = (
+    "x_padded",
+    "windows",
+    "input",
+    "x_centered",
+    "std_inv",
+    "x_norm",
+    "output",
+    "mask",
+    "arg_max",
+    "true_lengths",
+)
+
+# Chunk size used for inference (predict / validation inside fit) to keep GPU memory bounded.
+PREDICT_BATCH_SIZE = 512
+
 
 class Network(ABC):
     def __init__(
@@ -17,11 +35,42 @@ class Network(ABC):
         self.compiled = False
         self._activity_labels = []
 
-    def predict(self, x: Array, training: bool = False, mask: Array | None = None):
+    def predict(
+        self,
+        x: Array,
+        training: bool = False,
+        mask: Array | None = None,
+        batch_size: int | None = PREDICT_BATCH_SIZE,
+    ):
         x_dev = backend.asarray(x, dtype=self.xp.float32)
         mask_dev = backend.asarray(mask, dtype=self.xp.float32) if mask is not None else None
-        pred_dev = self._predict(x_dev, training=training, mask=mask_dev)
-        return backend.to_numpy(pred_dev)
+        if training:
+            pred_dev = self._predict(x_dev, training=True, mask=mask_dev)
+        else:
+            pred_dev = self._predict_batched(x_dev, mask_dev, batch_size)
+        pred = backend.to_numpy(pred_dev)
+        self.clear_cache()
+        return pred
+
+    def _predict_batched(self, x_dev: Array, mask_dev: Array | None, batch_size: int | None) -> Array:
+        """Inference in chunks - the peak memory (e.g. Conv1D im2col windows) scales with the chunk, not the dataset."""
+        num_samples = x_dev.shape[0]
+        if batch_size is None or num_samples <= batch_size:
+            return self._predict(x_dev, training=False, mask=mask_dev)
+        outputs = []
+        for start in range(0, num_samples, batch_size):
+            end = start + batch_size
+            m_batch = mask_dev[start:end] if mask_dev is not None else None
+            outputs.append(self._predict(x_dev[start:end], training=False, mask=m_batch))
+            self.clear_cache()
+        return self.xp.concatenate(outputs, axis=0)
+
+    def clear_cache(self) -> None:
+        """Drop activations cached by the last forward pass (they are only needed for backprop)."""
+        for layer in getattr(self, "layers", []):
+            for name in FORWARD_CACHE_VARS:
+                if getattr(layer, name, None) is not None:
+                    setattr(layer, name, None)
 
     @abstractmethod
     def _predict(self, x: Array, training: bool = False, mask: Array | None = None):
@@ -104,12 +153,14 @@ class Network(ABC):
 
             val_loss, val_acc = None, None
             if x_val is not None and y_val is not None:
-                val_pred = self._predict(x_val_dev, training=False, mask=val_mask_dev)
+                val_pred = self._predict_batched(x_val_dev, val_mask_dev, PREDICT_BATCH_SIZE)
                 val_loss = float(self.loss.forward(val_pred, y_val_dev))
                 if len(y_val_dev.shape) > 1 and y_val_dev.shape[1] > 1:
                     val_acc = float(self.xp.mean(self.xp.argmax(val_pred, axis=1) == self.xp.argmax(y_val_dev, axis=1)))
                 else:
                     val_acc = float(self.xp.mean(self.xp.argmax(val_pred, axis=1) == y_val_dev.reshape(-1)))
+                del val_pred
+                self.clear_cache()
             epoch_duration = time.time() - epoch_start_time
             history.update(
                 train_loss=loss_val,
@@ -152,6 +203,7 @@ class Network(ABC):
         if early_stopping_patience is not None:
             history.best_epoch = best_epoch
 
+        self.clear_cache()
         total_time = time.time() - start_training_time
         if verbose > 0:
             print(f"\nTraining Complete. Total Time: {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
